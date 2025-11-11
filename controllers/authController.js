@@ -175,7 +175,7 @@ const verifyOtp = async (req, res) => {
       email: pendingUser.email,
       password: pendingUser.password,
       referralCode: pendingUser.referralCode,
-      role: 'user',
+      role: 'User',
     });
     await user.save();
 
