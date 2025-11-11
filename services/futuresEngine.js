@@ -6,7 +6,7 @@ const { Asset } = require('../models/Asset');
 const { Notification } = require('../models/Notification');
 const { getCurrentPrice } = require('./futuresPriceFeed');
 
-// دالة ليكويد آمنة (مش مهم التفاصيل هنا لو عندك نسخة ثانية)
+// — نفس الدالة الآمنة —
 function calcLiquidationSafe({ side, qty, entryPrice, baseEquity, leverage, mmr = 0.004, feesBuffer = 0 }) {
   const q = Math.max(0, Number(qty));
   const E = Math.max(0, Number(entryPrice));
@@ -27,12 +27,10 @@ function calcLiquidationSafe({ side, qty, entryPrice, baseEquity, leverage, mmr 
 
 let ioRef = null;
 function bindIo(io) { ioRef = io; }
-function emitToUser(userId, payload) {
-  if (ioRef) ioRef.to(String(userId)).emit('futures_order_status_update', payload);
-}
+function emitToUser(userId, payload) { if (ioRef) ioRef.to(String(userId)).emit('futures_order_status_update', payload); }
 
 async function getUSDT() {
-  const usdt = await Asset.findOne({ symbol: 'USDT' });
+  const usdt = await Asset.findOne({ symbol: 'USDT' }).lean();
   if (!usdt) throw new Error('USDT asset not found');
   return usdt;
 }
@@ -87,7 +85,7 @@ async function executeLimitIfHit(order, currentPrice) {
     future_trade_id: order._id,
     user_id: order.user_id,
     trading_pair_id: order.trading_pair_id,
-    trading_pair_symbol: order.trading_pair_id?.symbol,
+    trading_pair_symbol: order.trading_pair_symbol, // نستخدم الحقل المباشر إن كان موجودًا
     position: order.position,
     leverage: order.leverage,
     amount: q,
@@ -109,7 +107,7 @@ async function executeLimitIfHit(order, currentPrice) {
   emitToUser(order.user_id, {
     trade_id: order._id.toString(),
     status: 'Filled',
-    symbol: order.trading_pair_id?.symbol,
+    symbol: order.trading_pair_symbol,
     open_price: E,
     liquidation_price: liq,
   });
@@ -138,14 +136,14 @@ async function closeTrade(trade, reason, closePrice) {
     future_trade_id: trade._id,
     user_id: trade.user_id,
     trading_pair_id: trade.trading_pair_id,
-    trading_pair_symbol: trade.trading_pair_id?.symbol,
+    trading_pair_symbol: trade.trading_pair_symbol,
     position: trade.position,
     leverage: trade.leverage,
     amount: q,
     open_price: E,
     close_price: closePrice,
     pnl,
-    status: reason,              // ← تظهر في الهيستوري Take Profit / Stop Loss / Liquidation / Closed
+    status: reason,
     executed_at: new Date(),
   });
 
@@ -162,52 +160,98 @@ async function closeTrade(trade, reason, closePrice) {
   emitToUser(trade.user_id, {
     trade_id: trade._id.toString(),
     status: (reason === 'Liquidation') ? 'Liquidated' : 'Closed',
-    symbol: trade.trading_pair_id?.symbol,
+    symbol: trade.trading_pair_symbol,
     close_price: closePrice,
     pnl,
   });
 }
 
-async function scanLimitOrders() {
-  const pending = await FutureTrade.find({ status: 'Pending', order_type: 'Limit' }).populate('trading_pair_id');
-  for (const ord of pending) {
-    if (!ord.trading_pair_id) continue;
-    const price = getCurrentPrice(ord.trading_pair_id.symbol);
-    if (!price) continue;
-    try { await executeLimitIfHit(ord, price); } catch (e) { /* log */ }
+// ——— مسح مُجزّأ وخفيف ——— //
+async function scanLimitOrders(batchSize = 500) {
+  let lastId = null;
+  // نختار حقولًا نحتاجها فقط + lean لتقليل الذاكرة
+  const baseQuery = { status: 'Pending', order_type: 'Limit' };
+  while (true) {
+    const chunk = await FutureTrade.find(
+      lastId ? { ...baseQuery, _id: { $gt: lastId } } : baseQuery,
+      {
+        _id: 1, user_id: 1, trading_pair_symbol: 1, trading_pair_id: 1,
+        position: 1, leverage: 1, amount: 1, limit_price: 1,
+        margin_type: 1, futures_wallet_id: 1,
+      }
+    )
+      .sort({ _id: 1 })
+      .limit(batchSize)
+      .lean();
+
+    if (!chunk.length) break;
+
+    for (const ord of chunk) {
+      const price = getCurrentPrice(ord.trading_pair_symbol || ord.trading_pair_id?.symbol);
+      if (!price) continue;
+      try {
+        // نعيد تحميل الوثيقة كاملة عند التنفيذ فقط (تقليل IO/Memory)
+        const doc = await FutureTrade.findById(ord._id);
+        if (doc) await executeLimitIfHit(doc, price);
+      } catch {/* log */}
+    }
+    lastId = chunk[chunk.length - 1]._id;
   }
 }
 
-async function scanOpenTrades() {
-  const openTrades = await FutureTrade.find({ status: 'Filled' }).populate('trading_pair_id');
-  for (const t of openTrades) {
-    if (!t.trading_pair_id) continue;
-    const price = getCurrentPrice(t.trading_pair_id.symbol);
-    if (!price) continue;
+async function scanOpenTrades(batchSize = 500) {
+  let lastId = null;
+  const baseQuery = { status: 'Filled' };
+  while (true) {
+    const chunk = await FutureTrade.find(
+      lastId ? { ...baseQuery, _id: { $gt: lastId } } : baseQuery,
+      {
+        _id: 1, user_id: 1, trading_pair_symbol: 1, trading_pair_id: 1,
+        position: 1, leverage: 1, amount: 1, open_price: 1,
+        liquidation_price: 1, take_profit_price: 1, stop_loss_price: 1,
+        futures_wallet_id: 1,
+      }
+    )
+      .sort({ _id: 1 })
+      .limit(batchSize)
+      .lean();
 
-    let shouldClose = false;
-    let reason = 'Manual Close';
+    if (!chunk.length) break;
 
-    if ((t.position === 'Long' && price <= t.liquidation_price) ||
-        (t.position === 'Short' && price >= t.liquidation_price)) {
-      shouldClose = true; reason = 'Liquidation';
-    }
-    if (!shouldClose && t.take_profit_price) {
-      if ((t.position === 'Long' && price >= t.take_profit_price) ||
-          (t.position === 'Short' && price <= t.take_profit_price)) {
-        shouldClose = true; reason = 'Take Profit';
+    for (const t of chunk) {
+      const symbol = t.trading_pair_symbol || t.trading_pair_id?.symbol;
+      const price = getCurrentPrice(symbol);
+      if (!price) continue;
+
+      let shouldClose = false;
+      let reason = 'Manual Close';
+
+      if ((t.position === 'Long' && price <= t.liquidation_price) ||
+          (t.position === 'Short' && price >= t.liquidation_price)) {
+        shouldClose = true; reason = 'Liquidation';
+      }
+      if (!shouldClose && t.take_profit_price) {
+        if ((t.position === 'Long' && price >= t.take_profit_price) ||
+            (t.position === 'Short' && price <= t.take_profit_price)) {
+          shouldClose = true; reason = 'Take Profit';
+        }
+      }
+      if (!shouldClose && t.stop_loss_price) {
+        if ((t.position === 'Long' && price <= t.stop_loss_price) ||
+            (t.position === 'Short' && price >= t.stop_loss_price)) {
+          shouldClose = true; reason = 'Stop Loss';
+        }
+      }
+
+      if (shouldClose) {
+        try {
+          // نعيد تحميل الوثيقة كاملة فقط لحظة الإغلاق
+          const doc = await FutureTrade.findById(t._id);
+          if (doc) await closeTrade(doc, reason, price);
+        } catch {/* log */}
       }
     }
-    if (!shouldClose && t.stop_loss_price) {
-      if ((t.position === 'Long' && price <= t.stop_loss_price) ||
-          (t.position === 'Short' && price >= t.stop_loss_price)) {
-        shouldClose = true; reason = 'Stop Loss';
-      }
-    }
-
-    if (shouldClose) {
-      try { await closeTrade(t, reason, price); } catch (e) { /* log */ }
-    }
+    lastId = chunk[chunk.length - 1]._id;
   }
 }
 
@@ -215,12 +259,13 @@ let engineTimer = null;
 function initFuturesEngine(io) {
   bindIo(io);
   if (engineTimer) clearInterval(engineTimer);
+  // 3 ثواني كافية، ويمكن رفعها إلى 5–10 ثواني حسب الحمل
   engineTimer = setInterval(async () => {
     try {
-      await scanLimitOrders();
-      await scanOpenTrades();
-    } catch (e) { /* log */ }
-  }, 2500);
+      await scanLimitOrders(400);  // دفعات أصغر = ذواكر أقل
+      await scanOpenTrades(400);
+    } catch {/* log */}
+  }, 3000);
 }
 
 module.exports = { initFuturesEngine, closeTrade };
