@@ -6,7 +6,7 @@ const { Asset } = require('../models/Asset');
 const { Notification } = require('../models/Notification');
 const { getCurrentPrice } = require('./futuresPriceFeed');
 
-// — نفس الدالة الآمنة —
+// Safer liquidation approximation
 function calcLiquidationSafe({ side, qty, entryPrice, baseEquity, leverage, mmr = 0.004, feesBuffer = 0 }) {
   const q = Math.max(0, Number(qty));
   const E = Math.max(0, Number(entryPrice));
@@ -30,7 +30,7 @@ function bindIo(io) { ioRef = io; }
 function emitToUser(userId, payload) { if (ioRef) ioRef.to(String(userId)).emit('futures_order_status_update', payload); }
 
 async function getUSDT() {
-  const usdt = await Asset.findOne({ symbol: 'USDT' }).lean();
+  const usdt = await Asset.findOne({ symbol: 'USDT' }, { _id: 1 }).lean();
   if (!usdt) throw new Error('USDT asset not found');
   return usdt;
 }
@@ -85,7 +85,7 @@ async function executeLimitIfHit(order, currentPrice) {
     future_trade_id: order._id,
     user_id: order.user_id,
     trading_pair_id: order.trading_pair_id,
-    trading_pair_symbol: order.trading_pair_symbol, // نستخدم الحقل المباشر إن كان موجودًا
+    trading_pair_symbol: order.trading_pair_symbol,
     position: order.position,
     leverage: order.leverage,
     amount: q,
@@ -166,10 +166,11 @@ async function closeTrade(trade, reason, closePrice) {
   });
 }
 
-// ——— مسح مُجزّأ وخفيف ——— //
-async function scanLimitOrders(batchSize = 500) {
+// Batched, memory-light scans
+const BATCH_SIZE = 400;
+
+async function scanLimitOrders(batchSize = BATCH_SIZE) {
   let lastId = null;
-  // نختار حقولًا نحتاجها فقط + lean لتقليل الذاكرة
   const baseQuery = { status: 'Pending', order_type: 'Limit' };
   while (true) {
     const chunk = await FutureTrade.find(
@@ -179,19 +180,17 @@ async function scanLimitOrders(batchSize = 500) {
         position: 1, leverage: 1, amount: 1, limit_price: 1,
         margin_type: 1, futures_wallet_id: 1,
       }
-    )
-      .sort({ _id: 1 })
-      .limit(batchSize)
-      .lean();
+    ).sort({ _id: 1 }).limit(batchSize).lean();
 
     if (!chunk.length) break;
 
     for (const ord of chunk) {
-      const price = getCurrentPrice(ord.trading_pair_symbol || ord.trading_pair_id?.symbol);
+      const symbol = ord.trading_pair_symbol || ord.trading_pair_id?.symbol;
+      if (!symbol) continue;
+      const price = getCurrentPrice(symbol);
       if (!price) continue;
       try {
-        // نعيد تحميل الوثيقة كاملة عند التنفيذ فقط (تقليل IO/Memory)
-        const doc = await FutureTrade.findById(ord._id);
+        const doc = await FutureTrade.findById(ord._id); // load only when needed
         if (doc) await executeLimitIfHit(doc, price);
       } catch {/* log */}
     }
@@ -199,7 +198,7 @@ async function scanLimitOrders(batchSize = 500) {
   }
 }
 
-async function scanOpenTrades(batchSize = 500) {
+async function scanOpenTrades(batchSize = BATCH_SIZE) {
   let lastId = null;
   const baseQuery = { status: 'Filled' };
   while (true) {
@@ -211,15 +210,13 @@ async function scanOpenTrades(batchSize = 500) {
         liquidation_price: 1, take_profit_price: 1, stop_loss_price: 1,
         futures_wallet_id: 1,
       }
-    )
-      .sort({ _id: 1 })
-      .limit(batchSize)
-      .lean();
+    ).sort({ _id: 1 }).limit(batchSize).lean();
 
     if (!chunk.length) break;
 
     for (const t of chunk) {
       const symbol = t.trading_pair_symbol || t.trading_pair_id?.symbol;
+      if (!symbol) continue;
       const price = getCurrentPrice(symbol);
       if (!price) continue;
 
@@ -245,7 +242,6 @@ async function scanOpenTrades(batchSize = 500) {
 
       if (shouldClose) {
         try {
-          // نعيد تحميل الوثيقة كاملة فقط لحظة الإغلاق
           const doc = await FutureTrade.findById(t._id);
           if (doc) await closeTrade(doc, reason, price);
         } catch {/* log */}
@@ -259,13 +255,12 @@ let engineTimer = null;
 function initFuturesEngine(io) {
   bindIo(io);
   if (engineTimer) clearInterval(engineTimer);
-  // 3 ثواني كافية، ويمكن رفعها إلى 5–10 ثواني حسب الحمل
   engineTimer = setInterval(async () => {
     try {
-      await scanLimitOrders(400);  // دفعات أصغر = ذواكر أقل
-      await scanOpenTrades(400);
-    } catch {/* log */}
-  }, 3000);
+      await scanLimitOrders(BATCH_SIZE);
+      await scanOpenTrades(BATCH_SIZE);
+    } catch (e) { /* log */ }
+  }, 3000); // 3s is a good balance for 2GB instances
 }
 
 module.exports = { initFuturesEngine, closeTrade };

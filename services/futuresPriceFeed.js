@@ -5,18 +5,17 @@ const { TradingPair } = require('../models/TradingPair');
 
 const priceMap = new Map();
 
-// —— إعدادات —— //
 const BINANCE_WS = 'wss://stream.binance.com:9443/stream';
 const HTTP_PRICE = (sym) => `https://api.binance.com/api/v3/ticker/price?symbol=${sym}`;
 const RECONNECT_BASE_MS = 1500;
+const MAX_STREAMS_PER_SOCKET = 200; // Split symbols to avoid very long urls
+const HEARTBEAT_MS = 15000;
 
-let ws = null;
-let reconnectAttempts = 0;
+let sockets = []; // [{ ws, symbols, hbTimer, reconnectAttempts }]
 let subscribedSymbols = [];
-let connecting = false;
 
 async function fetchPriceHTTP(symbol) {
-  const { data } = await axios.get(HTTP_PRICE(symbol));
+  const { data } = await axios.get(HTTP_PRICE(symbol), { timeout: 8000 });
   const p = parseFloat(data?.price);
   if (!Number.isFinite(p) || p <= 0) throw new Error('Invalid price');
   priceMap.set(symbol, p);
@@ -28,66 +27,76 @@ function buildCombinedUrl(symbols) {
   return `${BINANCE_WS}?streams=${streams}`;
 }
 
-function safeCloseSocket() {
-  try { ws?.removeAllListeners?.(); } catch {}
-  try { ws?.close?.(); } catch {}
-  ws = null;
+function cleanupSocket(entry) {
+  try { entry.ws?.removeAllListeners?.(); } catch {}
+  try { clearInterval(entry.hbTimer); } catch {}
+  try { entry.ws?.close?.(); } catch {}
+  entry.ws = null;
 }
 
-async function openCombinedSocket(symbols) {
-  if (connecting) return;
-  connecting = true;
-
-  safeCloseSocket();
-
+function openSocketGroup(symbols, idx) {
   const url = buildCombinedUrl(symbols);
-  ws = new WebSocket(url);
+  const entry = { ws: null, symbols, hbTimer: null, reconnectAttempts: 0 };
 
-  ws.on('open', () => {
-    reconnectAttempts = 0;
-    connecting = false;
-  });
+  const connect = () => {
+    cleanupSocket(entry);
+    entry.ws = new WebSocket(url);
 
-  ws.on('message', (raw) => {
-    try {
-      // رسالة الـ combined stream شكلها: { stream: "btcusdt@ticker", data: {...} }
-      const msg = JSON.parse(raw);
-      const data = msg?.data || msg; // احتياطًا
-      const symbol = (data?.s || '').toUpperCase();
-      const price = parseFloat(data?.c);
-      if (symbol && Number.isFinite(price) && price > 0) {
-        priceMap.set(symbol, price);
-      }
-    } catch {}
-  });
+    entry.ws.on('open', () => {
+      entry.reconnectAttempts = 0;
+      // Heartbeat
+      entry.hbTimer = setInterval(() => {
+        try { entry.ws?.ping?.(); } catch {}
+      }, HEARTBEAT_MS);
+    });
 
-  ws.on('error', () => {
-    // نحاول جلب الأسعار الأساسية عبر HTTP لبعض الرموز لتفادي انقطاع كامل
-    symbols.slice(0, 5).forEach((s) => fetchPriceHTTP(s).catch(() => {}));
-  });
+    entry.ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw);
+        const data = msg?.data || msg; // combined stream => { stream, data }
+        const symbol = (data?.s || '').toUpperCase();
+        const price = parseFloat(data?.c);
+        if (symbol && Number.isFinite(price) && price > 0) {
+          priceMap.set(symbol, price);
+        }
+      } catch { /* ignore */ }
+    });
 
-  ws.on('close', async () => {
-    connecting = false;
-    const delay = Math.min(RECONNECT_BASE_MS * Math.pow(2, reconnectAttempts++), 15000);
-    setTimeout(() => openCombinedSocket(symbols), delay);
-  });
+    entry.ws.on('error', () => {
+      // Try to refresh a few symbols via HTTP so engine isn't blind
+      symbols.slice(0, 5).forEach((s) => fetchPriceHTTP(s).catch(() => {}));
+    });
+
+    entry.ws.on('close', () => {
+      cleanupSocket(entry);
+      const backoff = Math.min(RECONNECT_BASE_MS * Math.pow(2, entry.reconnectAttempts++), 15000);
+      setTimeout(connect, backoff);
+    });
+  };
+
+  connect();
+  sockets[idx] = entry;
 }
 
 async function initFuturesPriceFeed() {
-  // اجلب الرموز مرة واحدة فقط
+  // Load symbols once
   const pairs = await TradingPair.find({}, { symbol: 1, _id: 0 }).lean();
   subscribedSymbols = (pairs || [])
     .map((p) => (p.symbol || '').toUpperCase())
     .filter(Boolean);
 
-  // جلب أولي عبر HTTP لعدد محدود حتى لا يُرفض طلب سوق فوري وقت الإقلاع
+  // Prefetch a few to warm cache at boot
   for (const s of subscribedSymbols.slice(0, 20)) {
     try { await fetchPriceHTTP(s); } catch {}
   }
 
-  // افتح سوكيت مُجمَّع
-  if (subscribedSymbols.length) {
-    await openCombinedSocket(subscribedSymbols);
+  // Split into groups to respect URL length and reliability
+  sockets.forEach(cleanupSocket);
+  sockets = [];
+
+  for (let i = 0; i < subscribedSymbols.length; i += MAX_STREAMS_PER_SOCKET) {
+    const chunk = subscribedSymbols.slice(i, i + MAX_STREAMS_PER_SOCKET);
+    openSocketGroup(chunk, sockets.length);
   }
 }
 
@@ -95,6 +104,7 @@ function getCurrentPrice(symbol) {
   return priceMap.get((symbol || '').toUpperCase()) || 0;
 }
 
+// Try cache first; if missing, get via HTTP now and cache it.
 async function ensureCurrentPrice(symbol) {
   const s = (symbol || '').toUpperCase();
   const cached = priceMap.get(s);

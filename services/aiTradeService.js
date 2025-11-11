@@ -11,15 +11,15 @@ const { SupportPrediction } = require('../models/SupportPrediction');
 const { getFourHourWindowUTC } = require('../controllers/supportPredictionController');
 
 let latestBinancePrice = null;
-let currentPrediction = null;        // { predictedPrice, timestamp, window_start, window_end, source }
-let currentWindow = null;            // { window_start, window_end }
+let currentPrediction = null;
+let currentWindow = null;
 let predictionPollTimer = null;
 
-// ——— Cache للمستخدمين الفعّالين لتفادي distinct المتكرر —— //
+// Cache active users for 2 minutes
 const activeUsersCache = {
   set: new Set(),
   nextRefresh: 0,
-  ttlMs: 2 * 60 * 1000, // حدّث كل دقيقتين
+  ttlMs: 2 * 60 * 1000,
 };
 async function getActiveUsers() {
   const now = Date.now();
@@ -35,19 +35,11 @@ async function getActiveUsers() {
   return Array.from(activeUsersCache.set);
 }
 
-function nowUtc() { return new Date(); }
 function clampPrediction(p) {
   const n = Number(p);
   if (!isFinite(n)) return null;
   if (n < 1000 || n > 150000) return null;
   return Number(n.toFixed(2));
-}
-
-function clearPredictionPolling() {
-  if (predictionPollTimer) {
-    clearInterval(predictionPollTimer);
-    predictionPollTimer = null;
-  }
 }
 
 function isWithinCurrentWindow(date = new Date()) {
@@ -88,10 +80,10 @@ async function resolveServerPrediction() {
   try {
     const resp = await axios.post('http://localhost:5000/predict', null, {
       headers: { 'Content-Type': 'application/json' },
-      timeout: 15000, // خفّضنا المهلة لتقليل التراكم
+      timeout: 15000,
     });
     const p = clampPrediction(resp.data?.prediction);
-    if (!p) throw new Error('Invalid or unrealistic prediction received');
+    if (!p) throw new Error('Invalid prediction from server model');
 
     const { window_start, window_end } = getFourHourWindowUTC(new Date());
     currentWindow = { window_start, window_end };
@@ -104,7 +96,6 @@ async function resolveServerPrediction() {
       source: 'server',
     };
 
-    // حفظ مُصغّر (بدون بيانات إضافية)
     await SupportPrediction.findOneAndUpdate(
       { window_start, window_end },
       { $set: { value: p, source: 'server', updated_at: new Date() }, $setOnInsert: { created_at: new Date() } },
@@ -131,7 +122,6 @@ async function resolveActivePrediction(io, emit = true) {
       source: pred.source,
     });
 
-    // شغّل الاستراتيجية للمستخدمين الفعّالين (من الكاش)
     try {
       const activeUsers = await getActiveUsers();
       for (const user_id of activeUsers) {
@@ -144,7 +134,7 @@ async function resolveActivePrediction(io, emit = true) {
   return pred;
 }
 
-// ——— WebSocket آمن لـ Binance (سوكيت واحد + Backoff) ——— //
+// Binance WS (single ticker + 4h kline)
 let priceWs = null;
 let klineWs = null;
 let wsConnecting = false;
@@ -187,7 +177,7 @@ function openPriceSockets(io) {
   klineWs.on('message', async (data) => {
     try {
       const message = JSON.parse(data);
-      if (message.k && message.k.x) {
+      if (message.k && message.k.x) { // closed 4h candle
         currentPrediction = null;
         const { window_start, window_end } = getFourHourWindowUTC(new Date());
         currentWindow = { window_start, window_end };
@@ -200,7 +190,7 @@ function openPriceSockets(io) {
         }
       }
     } catch (error) {
-      console.error('Error processing kline WebSocket message:', error.message);
+      console.error('Error processing kline message:', error.message);
     }
   });
   klineWs.on('error', () => {});
@@ -209,20 +199,19 @@ function openPriceSockets(io) {
     setTimeout(() => openPriceSockets(io), backoff);
   });
 
-  // إطلاق تنبؤ ابتدائي
   resolveActivePrediction(io, true).then(() => startPredictionPolling(io)).catch((e) => console.error('Initial prediction error:', e.message));
 }
 
 function startPredictionPolling(io) {
-  clearPredictionPolling();
+  if (predictionPollTimer) clearInterval(predictionPollTimer);
   predictionPollTimer = setInterval(async () => {
     if (!currentPrediction || !isWithinCurrentWindow()) {
       await resolveActivePrediction(io, true);
     }
-  }, 60 * 1000); // كل 60 ثانية بدلاً من 30 لتخفيف الضغط
+  }, 60 * 1000);
 }
 
-// ——— فتح / إغلاق صفقات AI (كما هي مع ضبط صغير) ——— //
+// Open / close AI trades
 const openTrade = async ({ user_id, ai_wallet_id, investment, leverage, tradeCount, tradeType }) => {
   try {
     if (!user_id || typeof user_id !== 'string') throw new Error(`Invalid user_id: ${user_id}`);
@@ -287,7 +276,6 @@ const openTrade = async ({ user_id, ai_wallet_id, investment, leverage, tradeCou
 
     await trade.save();
 
-    // منطق الإحالة (اختياري)
     try {
       const referral = await Referral.findOne({ referred_user_id: user_id, status: 'Pending' }).lean();
       if (referral && totalDeduction >= 50) {
@@ -381,13 +369,11 @@ const closeTrade = async (tradeId, currentPrice, io, reason = 'Manual') => {
   }
 };
 
-// ——— إدارة الصفقات: استعلام خفيف لكل مستخدم ——— //
 const manageTrades = async (io, currentPrice, predictedPrice, user_id) => {
   try {
     if (!user_id) return;
     if (!Number.isFinite(currentPrice)) return;
 
-    // نقرأ حقولًا محدودة + lean لتقليل الذاكرة
     const activeTrades = await AITrade.find(
       { user_id, status: 'Active' },
       { _id: 1, user_id: 1, trade_type: 1, trade_direction: 1, predicted_price: 1, liquidation_price: 1,
@@ -395,7 +381,6 @@ const manageTrades = async (io, currentPrice, predictedPrice, user_id) => {
     ).lean();
 
     for (const trade of activeTrades) {
-      // 1) التصفية
       const liq = Number(trade.liquidation_price || 0);
       let hitLiq = false;
       if (trade.trade_direction === 'Long')  { if (liq > 0 && currentPrice <= liq) hitLiq = true; }
@@ -405,17 +390,13 @@ const manageTrades = async (io, currentPrice, predictedPrice, user_id) => {
         continue;
       }
 
-      // 2) الهدف
-      const isTargetReached =
-        Math.abs(currentPrice - trade.predicted_price) <= 0.005 * trade.predicted_price;
+      const isTargetReached = Math.abs(currentPrice - trade.predicted_price) <= 0.005 * trade.predicted_price;
 
-      // 3) تنبؤ حالي
       const haveActivePrediction = currentPrediction && isWithinCurrentWindow();
       let newDirection = null;
       if (haveActivePrediction) {
         newDirection = currentPrediction.predictedPrice > currentPrice ? 'Long' : 'Short';
       }
-
       const isOpposite = haveActivePrediction && newDirection && (newDirection !== trade.trade_direction);
 
       if (isTargetReached || (trade.trade_type === 'Automated' && isOpposite)) {
@@ -433,6 +414,8 @@ const manageTrades = async (io, currentPrice, predictedPrice, user_id) => {
           });
           io?.to(String(user_id)).emit('trade_opened', {
             ...newTrade.toObject(),
+            predicted_price: newTrade.predicted_price,
+            entry_price: newTrade.entry_price,
             formatted_predicted_price: `$${newTrade.predicted_price.toFixed(2)}`,
             formatted_entry_price: `$${newTrade.entry_price.toFixed(2)}`,
           });
@@ -440,7 +423,7 @@ const manageTrades = async (io, currentPrice, predictedPrice, user_id) => {
       }
     }
   } catch (error) {
-    console.error('Error managing trades:', error.message);
+    console.error('Error managing trades:', error.message, error.stack);
   }
 };
 
