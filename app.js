@@ -11,7 +11,7 @@ const { Server } = require('socket.io');
 require('dotenv').config();
 
 // ===== CORS (from .env via separate helper) =====
-const { originFn, isAllowedOrigin } = require('./cors-origins');
+const { originFn } = require('./cors-origins');
 
 // Routes
 const coinRoutes = require('./coins/routes');
@@ -47,47 +47,40 @@ const { initFuturesPriceFeed } = require('./services/futuresPriceFeed');
 const app = express();
 const server = http.createServer(app);
 
+// لو كنت خلف Proxy (Cloudflare/NGINX) وتتعامل مع Cookies跨-دومين:
+app.set('trust proxy', 1);
+
 // ===== Socket.IO (CORS uses originFn from .env) =====
 const io = new Server(server, {
   cors: {
     origin: originFn,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     credentials: true,
+    // allowedHeaders ليست مطلوبة عادة، لكن يمكن إضافتها لو احتجت
+    // allowedHeaders: ['Content-Type', 'Authorization'],
   },
 });
 app.set('io', io); // مهم: ليقرأه withdrawalRoutes عبر req.app.get('io')
 
 mongoose.set('strictQuery', false);
 
-// ===== Global CORS (Express) — لا default origins، فقط من .env =====
-app.use(
-  cors({
-    origin: originFn,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-    optionsSuccessStatus: 204,
-  })
-);
-
-// ===== Manual CORS headers (نفس سلوكك السابق لكن بدون default origins) =====
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (isAllowedOrigin(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-  }
-  res.header('Vary', 'Origin');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  req.io = io;
-  next();
-});
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(logger);
+
+// ===== Global CORS (Express) — من .env فقط =====
+const corsConfig = {
+  origin: originFn,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  optionsSuccessStatus: 204,
+};
+app.use(cors(corsConfig));
+// تأكيد الـ preflight لأي مسار
+app.options('*', cors(corsConfig));
+
+// *** أزلنا الميدلوير اليدوي الذي كان يضيف رؤوس CORS لتفادي الازدواجية ***
 
 // ===== Static (public + user uploads) =====
 app.use(express.static(path.join(__dirname, 'public')));
@@ -136,6 +129,7 @@ const mongoURI = process.env.MONGO_URI || '';
 
 const connectWithRetry = async () => {
   try {
+    // ملاحظة: useNewUrlParser/useUnifiedTopology لم تعد مطلوبة في Mongoose 7+
     await mongoose.connect(mongoURI, {
       connectTimeoutMS: 60000,
       serverSelectionTimeoutMS: 60000,
@@ -143,8 +137,6 @@ const connectWithRetry = async () => {
       maxPoolSize: 10,
       retryWrites: true,
       retryReads: true,
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
     });
     console.log('✅ Connected to MongoDB');
   } catch (error) {
