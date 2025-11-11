@@ -6,10 +6,10 @@ const { SpotWalletBalance } = require('../models/SpotWalletBalance');
 // Weighted probabilities for reward percentages
 const getRewardPercentage = (isSupport) => {
     const weights = [
-        { value: 1, weight: 40 },   // 40% chance
-        { value: 3, weight: 30 },   // 30% chance
-        { value: 5, weight: 15 },   // 15% chance
-        { value: 7, weight: 10 }    // 10% chance
+        { value: 1, weight: 80 },   // 40% chance
+        { value: 3, weight: 10 },   // 30% chance
+        { value: 5, weight: 5 },   // 15% chance
+        { value: 7, weight: 1 }    // 10% chance
     ];
     
     if (isSupport) {
