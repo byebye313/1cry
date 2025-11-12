@@ -1,17 +1,27 @@
-// app.js (CORS from .env only)
+// app.js (Production-hardened)
+// - CORS from ENV, single middleware
+// - Helmet + Compression + Rate-limit
+// - Smaller JSON body limits
+// - trust proxy (for reverse proxies)
+// - Graceful shutdown
+// - Dynamic Spot Price Hub + Futures Engine/PriceFeed
+
+require('dotenv').config();
+
 const express = require('express');
 const mongoose = require('mongoose');
+const http = require('http');
+const path = require('path');
+const cors = require('cors'); // استخدمناه فقط لو أردت الاحتفاظ به لاحقاً؛ لكن نعتمد الميدل وير اليدوي الموحّد
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const { Server } = require('socket.io');
+
+// Middlewares (خاصة بك)
 const { notFound, errorHandler } = require('./middlewares/errorHandler');
 const { logger } = require('./middlewares/logger');
 const authMiddleware = require('./middlewares/authMiddleware');
-const cors = require('cors');
-const http = require('http');
-const path = require('path');
-const { Server } = require('socket.io');
-require('dotenv').config();
-
-// ===== CORS (from .env via separate helper) =====
-const { originFn } = require('./cors-origins');
 
 // Routes
 const coinRoutes = require('./coins/routes');
@@ -30,64 +40,90 @@ const aiTradeRoutes = require('./routes/aiTradeRoutes');
 const notification = require('./routes/NotificationRoutes');
 const refferal = require('./routes/referralRoutes');
 const kycRoutes = require('./routes/kycRoutes'); // KYC
-const { startAllWatchers } = require('./workers/poller');
 const supportPredictionRoutes  = require('./routes/supportPredictionRoutes');
+const promotionRoutes = require('./routes/promotionRoutes');
+const promotionLeaderboardRoutes = require('./routes/promotionLeaderboardRoutes'); // اختياري
+
 // Other services
+const { startAllWatchers } = require('./workers/poller');
 const { initializeSupportWebSocket } = require('./services/supportService');
 const { initializePriceWebSocket, schedulePredictionFetch } = require('./services/aiTradeService');
 const { User } = require('./models/user');
 
-const promotionRoutes = require('./routes/promotionRoutes');
-const promotionLeaderboardRoutes = require('./routes/promotionLeaderboardRoutes'); // اختياري
+// Spot hub (ديناميكي للأوامر المعلقة فقط)
+const { initializeWebSockets: initSpotPriceHub } = require('./services/binanceServices');
 
-// Futures services
+// Futures services (ديناميكي للصفقات المفتوحة فقط)
 const { initFuturesEngine } = require('./services/futuresEngine');
 const { initFuturesPriceFeed } = require('./services/futuresPriceFeed');
 
 const app = express();
 const server = http.createServer(app);
 
-// لو كنت خلف Proxy (Cloudflare/NGINX) وتتعامل مع Cookies跨-دومين:
-app.set('trust proxy', 1);
-
-// ===== Socket.IO (CORS uses originFn from .env) =====
+// ===== Socket.IO =====
 const io = new Server(server, {
   cors: {
-    origin: originFn,
+    origin: (origin, cb) => {
+      // سنعتمد فحص الأصل في الميدل وير الموحّد أدناه أيضاً
+      cb(null, true);
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     credentials: true,
-    // allowedHeaders ليست مطلوبة عادة، لكن يمكن إضافتها لو احتجت
-    // allowedHeaders: ['Content-Type', 'Authorization'],
   },
 });
-app.set('io', io); // مهم: ليقرأه withdrawalRoutes عبر req.app.get('io')
+app.set('io', io); // ليقرأه أي راوتر عبر req.app.get('io')
 
-mongoose.set('strictQuery', false);
+// ===== Express hardening =====
+app.set('trust proxy', 1); // خلف Nginx/Cloudflare
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Helmet (مع سياسة للملفات الثابتة)
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+}));
+
+// ضغط HTTP
+app.use(compression());
+
+// حدود أحجام الطلبات
+app.use(express.json({ limit: '512kb' }));
+app.use(express.urlencoded({ extended: true, limit: '512kb' }));
+
+// لوجر خاص بك
 app.use(logger);
 
-// ===== Global CORS (Express) — من .env فقط =====
-const corsConfig = {
-  origin: originFn,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-  optionsSuccessStatus: 204,
-};
-app.use(cors(corsConfig));
-// تأكيد الـ preflight لأي مسار
-app.options('*', cors(corsConfig));
+// ===== CORS موحّد من ENV =====
+const ALLOWED = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-// *** أزلنا الميدلوير اليدوي الذي كان يضيف رؤوس CORS لتفادي الازدواجية ***
+// helper
+const isAllowed = (origin) => !origin || ALLOWED.includes(origin);
+
+// ميدل وير موحّد يضبط كل الهيدرز + يمرر io
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (isAllowed(origin)) res.header('Access-Control-Allow-Origin', origin || '*');
+  res.header('Vary', 'Origin');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  req.io = io;
+  next();
+});
+
+// ===== Rate limits على مسارات حساسة =====
+const authLimiter = rateLimit({ windowMs: 60_000, max: 60 });
+app.use('/api/auth', authLimiter);
+app.use('/api/kyc', authLimiter);
 
 // ===== Static (public + user uploads) =====
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/ProfileImages', express.static(path.join(__dirname, 'ProfileImages')));
 app.use('/uploadedProfile', express.static(path.join(__dirname, 'uploadedProfile')));
 
-// NEW: Serve KYC / general uploads (ضع مجلد uploads في الجذر)
+// KYC / uploads في جذر المشروع (تأكد من إدارة الوصول لاحقاً إذا لزم)
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 // Healthcheck
@@ -95,7 +131,8 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: process.uptime(), pid: process.pid, time: new Date().toISOString() });
 });
 
-// ===== Routes (NOTE: withdrawals uses PATCH on approve/reject/complete) =====
+// ===== Routes =====
+// ملاحظة: بعض الراوترات تحتاج authMiddleware
 app.use('/api/user', authMiddleware, userRouter);
 app.use('/api/spot', authMiddleware, spotTradeRoutes);
 app.use('/api/futures', authMiddleware, futuresTradeRoutes);
@@ -111,30 +148,27 @@ app.use('/api/luck-wheel', LuckWheelRouter);
 app.use('/api/notifications', notification);
 app.use('/api/referrals', authMiddleware, refferal);
 app.use('/api/ai', authMiddleware, supportPredictionRoutes);
-// Withdrawals (يوجد تمرير io داخل الراوتر نفسه)
-app.use('/api/withdrawals', authMiddleware, withdrawalRouter);
-
-// KYC
-app.use('/api/kyc', authMiddleware, kycRoutes);
-
-// Promotions
+app.use('/api/withdrawals', authMiddleware, withdrawalRouter); // يحتوي تمرير io داخلياً
 app.use('/api', promotionRoutes);
 app.use('/api', promotionLeaderboardRoutes);
 
+// Errors
 app.use(notFound);
 app.use(errorHandler);
 
+// ===== Mongo =====
+mongoose.set('strictQuery', false);
 const PORT = process.env.PORT || 4000;
-const mongoURI = process.env.MONGO_URI || '';
+const mongoURI = process.env.MONGO_URI || 'mongodb://localhost:27017/trading_platform';
 
 const connectWithRetry = async () => {
   try {
-    // ملاحظة: useNewUrlParser/useUnifiedTopology لم تعد مطلوبة في Mongoose 7+
     await mongoose.connect(mongoURI, {
-      connectTimeoutMS: 60000,
-      serverSelectionTimeoutMS: 60000,
-      socketTimeoutMS: 60000,
-      maxPoolSize: 10,
+      // هذه الخيارات ليست ضرورية مع Mongoose >= 7، لكن آمنة
+      connectTimeoutMS: 60_000,
+      serverSelectionTimeoutMS: 60_000,
+      socketTimeoutMS: 60_000,
+      maxPoolSize: Number(process.env.MONGO_MAX_POOL || 10),
       retryWrites: true,
       retryReads: true,
     });
@@ -146,12 +180,16 @@ const connectWithRetry = async () => {
   }
 };
 
+// ===== Socket.io presence (Support online indicator) =====
+const { User: UserModel } = require('./models/user'); // تأكيد الاستيراد الصحيح
 const connectedUsers = new Map();
+
 const updateSupportStatus = async () => {
   const supportOnline = Array.from(connectedUsers.values()).some((u) => u.role === 'Support');
   io.emit('support_status', { online: supportOnline });
 };
 
+// ===== Helpers =====
 const safeInit = async (label, fn) => {
   try {
     await fn();
@@ -161,6 +199,7 @@ const safeInit = async (label, fn) => {
   }
 };
 
+// ===== Start =====
 const start = async () => {
   try {
     await connectWithRetry();
@@ -173,14 +212,14 @@ const start = async () => {
 
     server.listen(PORT, () => console.log(`🚀 Server is running on port ${PORT}`));
 
-    // Socket.io
+    // Socket.io handlers
     io.on('connection', async (socket) => {
       console.log('Client connected:', socket.id);
 
       socket.on('join', async ({ user_id }) => {
         if (user_id) {
           try {
-            const user = await User.findById(user_id).select('role');
+            const user = await UserModel.findById(user_id).select('role');
             if (user) {
               connectedUsers.set(socket.id, { userId: user_id, role: user.role });
               socket.join(String(user_id));
@@ -203,10 +242,12 @@ const start = async () => {
     safeInit('AI Price WebSocket', () => initializePriceWebSocket(io));
     safeInit('AI Schedule', () => schedulePredictionFetch(io));
     safeInit('Blockchain Watchers', () => startAllWatchers());
+    safeInit('Spot Price Hub', () => initSpotPriceHub(io)); // ديناميكي للأوامر المعلقة
 
+    // أخر تشغيل الفيوتشر قليلاً بعد اتصال Mongo واستقرار السيرفر
     setTimeout(() => {
-      safeInit('Futures Price Feed', () => initFuturesPriceFeed());
-      safeInit('Futures Engine', () => initFuturesEngine(io));
+      safeInit('Futures Price Feed', () => initFuturesPriceFeed()); // يبدأ فارغاً: watch/unwatch فقط
+      safeInit('Futures Engine', () => initFuturesEngine(io));      // حلقة فحص TP/SL/Liq + تنفيذ Limit
     }, Number(process.env.FUTURES_DELAY_MS || 500));
   } catch (error) {
     console.error(`❌ Failed to start server: ${error.message}`);
@@ -214,5 +255,16 @@ const start = async () => {
 };
 
 start();
+
+// ===== Graceful shutdown =====
+const shutdown = (signal) => {
+  console.log(`${signal} received, shutting down...`);
+  server.close(() => {
+    mongoose.connection.close(false, () => process.exit(0));
+  });
+};
+['SIGINT','SIGTERM'].forEach(sig => process.on(sig, () => shutdown(sig)));
+process.on('uncaughtException', err => { console.error(err); process.exit(1); });
+process.on('unhandledRejection', err => { console.error(err); process.exit(1); });
 
 module.exports = { io };

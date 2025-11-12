@@ -1,27 +1,21 @@
+// controllers/spotTradeController.js
 const mongoose = require('mongoose');
 const { SpotTrade, validateSpotTrade } = require('../models/SpotTrade');
 const { OrderBook, validateOrderBook } = require('../models/OrderBook');
 const { SpotWalletBalance } = require('../models/SpotWalletBalance');
 const { TradingPair } = require('../models/TradingPair');
 const { SpotWallet } = require('../models/SpotWallet');
-const { getCurrentPrice } = require('../services/binanceServices');
 const { Notification } = require('../models/Notification');
 const { Referral } = require('../models/Refferal');
-const axios = require('axios');
 
-async function fetchPriceFromBinance(symbol) {
-  try {
-    const response = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
-    const price = parseFloat(response.data.price);
-    if (isNaN(price) || price <= 0) {
-      throw new Error('Invalid price received from Binance.');
-    }
-    return price;
-  } catch (error) {
-    console.error(`Error fetching price from Binance for ${symbol}:`, error.message);
-    return null;
-  }
-}
+const {
+  getCurrentPrice,
+  ensureCurrentPrice,
+  watchSymbolForSpotOrder,
+  unwatchSymbolForSpotOrder,
+} = require('../services/binanceServices');
+
+const axios = require('axios');
 
 async function createSpotTrade(req, res) {
   const { error } = validateSpotTrade(req.body);
@@ -29,27 +23,14 @@ async function createSpotTrade(req, res) {
 
   const { trading_pair_id, trade_type, order_type, limit_price, amount } = req.body;
   const user_id = req.user?.id;
-
-  if (!user_id) {
-    console.error('User ID not found in token.');
-    return res.status(401).send('Please log in first.');
-  }
-
-  console.log('User ID from token:', user_id);
+  if (!user_id) return res.status(401).send('Please log in first.');
 
   let userIdAsObjectId;
-  try {
-    userIdAsObjectId = new mongoose.Types.ObjectId(user_id);
-  } catch (err) {
-    console.error('Error converting user ID to ObjectId:', err.message);
-    return res.status(400).send('Invalid user ID.');
-  }
+  try { userIdAsObjectId = new mongoose.Types.ObjectId(user_id); }
+  catch { return res.status(400).send('Invalid user ID.'); }
 
   let spotWallet = await SpotWallet.findOne({ user_id: userIdAsObjectId });
-  console.log('Spot wallet query result:', spotWallet);
-
   if (!spotWallet) {
-    console.log('Creating a new spot wallet for user:', user_id);
     spotWallet = new SpotWallet({ user_id: userIdAsObjectId });
     await spotWallet.save();
   }
@@ -60,9 +41,9 @@ async function createSpotTrade(req, res) {
 
   let currentPrice = getCurrentPrice(tradingPair.symbol);
   if (order_type === 'Market' && (!currentPrice || currentPrice === 0)) {
-    console.log(`Price not available in priceMap for ${tradingPair.symbol}, attempting to fetch from Binance.`);
-    currentPrice = await fetchPriceFromBinance(tradingPair.symbol);
-    if (!currentPrice || currentPrice === 0) {
+    try {
+      currentPrice = await ensureCurrentPrice(tradingPair.symbol);
+    } catch {
       return res.status(400).send('Current market price is unavailable. Please try again later.');
     }
   }
@@ -81,11 +62,11 @@ async function createSpotTrade(req, res) {
 
   if (trade_type === 'Sell') {
     if (!baseAssetBalance || baseAssetBalance.balance < amount) {
-      return res.status(400).send(`Insufficient balance for ${tradingPair.base_asset_id}.`);
+      return res.status(400).send(`Insufficient balance for base asset.`);
     }
   } else if (trade_type === 'Buy') {
     if (!quoteAssetBalance || quoteAssetBalance.balance < totalCost) {
-      return res.status(400).send(`Insufficient balance for ${tradingPair.quote_asset_id}.`);
+      return res.status(400).send(`Insufficient balance for quote asset.`);
     }
   }
 
@@ -113,11 +94,13 @@ async function createSpotTrade(req, res) {
         quoteAssetBalance.balance = (quoteAssetBalance.balance || 0) + totalCost;
       }
 
-      await quoteAssetBalance.save();
-      await baseAssetBalance.save();
-      await trade.save();
+      await Promise.all([
+        quoteAssetBalance.save(),
+        baseAssetBalance.save(),
+        trade.save(),
+      ]);
 
-      // Check and update referral status if trade value is >= 50 USDT
+      // Referral logic
       const referral = await Referral.findOne({ referred_user_id: user_id, status: 'Pending' });
       if (referral && totalCost >= 50) {
         referral.status = 'Eligible';
@@ -125,27 +108,26 @@ async function createSpotTrade(req, res) {
         referral.trade_amount = totalCost;
         await referral.save();
 
-        const referrerNotification = new Notification({
+        await new Notification({
           user_id: referral.referrer_id,
           type: 'Referral',
           title: 'Referral Status Updated',
           message: `Your referral's trade of ${totalCost} USDT has met the 50 USDT minimum. Status updated to Eligible!`,
           is_read: false,
-        });
-        await referrerNotification.save();
+        }).save();
       }
 
-      const notification = new Notification({
+      await new Notification({
         user_id: userIdAsObjectId,
         type: 'SpotTrade',
-        title: `Market ${trade_type === 'Buy' ? 'Buy' : 'Sell'} Order Executed`,
-        message: `${trade_type === 'Buy' ? 'Buy' : 'Sell'} order for ${tradingPair.symbol} was executed at price ${currentPrice} for amount ${amount}.`,
+        title: `Market ${trade_type === 'Buy' ? 'Buy' : 'Sell'} Executed`,
+        message: `${trade_type === 'Buy' ? 'Buy' : 'Sell'} ${tradingPair.symbol} at ${currentPrice}, amount ${amount}.`,
         is_read: false,
-      });
-      await notification.save();
+      }).save();
 
       return res.status(201).send(trade);
-    } else if (order_type === 'Limit') {
+    } else {
+      // Limit: create OrderBook + start watching its symbol
       const orderData = {
         trading_pair_id,
         trade_id: trade._id.toString(),
@@ -155,22 +137,24 @@ async function createSpotTrade(req, res) {
         amount,
       };
 
-      const { error: orderError } = validateOrderBook(orderData);
+      const { error: orderError } = require('../models/OrderBook').validateOrderBook(orderData);
       if (orderError) return res.status(400).send(orderError.details[0].message);
 
-      const order = new OrderBook(orderData);
+      const order = new (require('../models/OrderBook').OrderBook)(orderData);
 
       await order.save();
       await trade.save();
 
-      const notification = new Notification({
+      // start dynamic WS for this symbol keyed by this order id
+      watchSymbolForSpotOrder(tradingPair.symbol, order._id);
+
+      await new Notification({
         user_id: userIdAsObjectId,
         type: 'SpotTrade',
-        title: `Limit ${trade_type === 'Buy' ? 'Buy' : 'Sell'} Order Placed`,
-        message: `Limit ${trade_type === 'Buy' ? 'Buy' : 'Sell'} order for ${tradingPair.symbol} placed at price ${limit_price} for amount ${amount}.`,
+        title: `Limit ${trade_type === 'Buy' ? 'Buy' : 'Sell'} Placed`,
+        message: `Limit ${trade_type === 'Buy' ? 'Buy' : 'Sell'} for ${tradingPair.symbol} at ${limit_price}, amount ${amount}.`,
         is_read: false,
-      });
-      await notification.save();
+      }).save();
 
       return res.status(201).send(trade);
     }
@@ -186,21 +170,29 @@ async function cancelSpotTrade(req, res) {
   if (trade.status !== 'Pending') return res.status(400).send('Only pending trades can be cancelled.');
 
   try {
+    const OrderBookModel = require('../models/OrderBook').OrderBook;
+    const order = await OrderBookModel.findOne({ trade_id: trade._id.toString(), status: 'Pending' });
+
     trade.status = 'Cancelled';
-    const order = await OrderBook.findOne({ trade_id: trade._id.toString(), status: 'Pending' });
     if (order) order.status = 'Cancelled';
+
     await trade.save();
     if (order) await order.save();
 
+    // release dynamic watch if any
+    if (order) {
+      const pair = await TradingPair.findById(trade.trading_pair_id).select('symbol');
+      if (pair?.symbol) unwatchSymbolForSpotOrder(pair.symbol, order._id);
+    }
+
     const tradingPair = await TradingPair.findById(trade.trading_pair_id);
-    const notification = new Notification({
+    await new Notification({
       user_id: trade.user_id,
       type: 'SpotTrade',
       title: 'Limit Order Cancelled',
-      message: `Your ${trade.trade_type === 'Buy' ? 'Buy' : 'Sell'} limit order for ${tradingPair.symbol} (amount: ${trade.amount}) has been cancelled.`,
+      message: `Your ${trade.trade_type} limit order for ${tradingPair.symbol} (amount: ${trade.amount}) has been cancelled.`,
       is_read: false,
-    });
-    await notification.save();
+    }).save();
 
     res.status(200).send(trade);
   } catch (err) {
