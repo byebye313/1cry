@@ -1,12 +1,20 @@
 // services/futuresEngine.js
+// HTTP-only integration: relies on futuresPriceFeed polling (no WS).
+// Engine scans every FUTURES_ENGINE_MS (default 40000 ms).
+
 const { FutureTrade } = require('../models/FutureTrade');
 const { FuturesTradeHistory } = require('../models/FutureTradeHistory');
 const { FuturesWalletBalance } = require('../models/FutureWalletBalance');
 const { Asset } = require('../models/Asset');
 const { Notification } = require('../models/Notification');
-const { getCurrentPrice } = require('./futuresPriceFeed');
+const {
+  getCurrentPrice,
+  addFuturesSymbol,
+  removeFuturesSymbol,
+} = require('./futuresPriceFeed');
 
-// دالة ليكويد آمنة (مش مهم التفاصيل هنا لو عندك نسخة ثانية)
+const FUTURES_ENGINE_MS = Number(process.env.FUTURES_ENGINE_MS || 40000); // 40s
+
 function calcLiquidationSafe({ side, qty, entryPrice, baseEquity, leverage, mmr = 0.004, feesBuffer = 0 }) {
   const q = Math.max(0, Number(qty));
   const E = Math.max(0, Number(entryPrice));
@@ -114,6 +122,9 @@ async function executeLimitIfHit(order, currentPrice) {
     liquidation_price: liq,
   });
 
+  // أصبحت الصفقة مفتوحة على هذا الرمز -> تأكد من تضمينه ضمن الرموز النشطة
+  if (order.trading_pair_id?.symbol) addFuturesSymbol(order.trading_pair_id.symbol);
+
   return true;
 }
 
@@ -145,7 +156,7 @@ async function closeTrade(trade, reason, closePrice) {
     open_price: E,
     close_price: closePrice,
     pnl,
-    status: reason,              // ← تظهر في الهيستوري Take Profit / Stop Loss / Liquidation / Closed
+    status: reason, // 'Closed' | 'Liquidation' | 'Take Profit' | 'Stop Loss'
     executed_at: new Date(),
   });
 
@@ -166,6 +177,14 @@ async function closeTrade(trade, reason, closePrice) {
     close_price: closePrice,
     pnl,
   });
+
+  // بعد الإغلاق: إذا لم تعد هناك صفقات Filled ولا أوامر Pending/Limit لهذا الرمز -> أزله من مجموعة الرموز النشطة
+  if (trade.trading_pair_id?.symbol) {
+    const symbol = trade.trading_pair_id.symbol;
+    const anyOpen   = await FutureTrade.exists({ 'trading_pair_id': trade.trading_pair_id, status: 'Filled' });
+    const anyLimit  = await FutureTrade.exists({ 'trading_pair_id': trade.trading_pair_id, status: 'Pending', order_type: 'Limit' });
+    if (!anyOpen && !anyLimit) removeFuturesSymbol(symbol);
+  }
 }
 
 async function scanLimitOrders() {
@@ -173,7 +192,7 @@ async function scanLimitOrders() {
   for (const ord of pending) {
     if (!ord.trading_pair_id) continue;
     const price = getCurrentPrice(ord.trading_pair_id.symbol);
-    if (!price) continue;
+    if (!price) continue; // لا نجلب HTTP هنا حتى نلتزم بدورة 40 ثانية
     try { await executeLimitIfHit(ord, price); } catch (e) { /* log */ }
   }
 }
@@ -220,7 +239,7 @@ function initFuturesEngine(io) {
       await scanLimitOrders();
       await scanOpenTrades();
     } catch (e) { /* log */ }
-  }, 2500);
+  }, FUTURES_ENGINE_MS); // 40s
 }
 
 module.exports = { initFuturesEngine, closeTrade };

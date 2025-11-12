@@ -51,8 +51,7 @@ const { initializePriceWebSocket, schedulePredictionFetch } = require('./service
 const { User } = require('./models/user');
 
 // Spot hub (ديناميكي للأوامر المعلقة فقط)
-const { initializeWebSockets: initSpotPriceHub } = require('./services/binanceServices');
-
+const { initializeSpotPolling } = require('./services/binanceServices');
 // Futures services (ديناميكي للصفقات المفتوحة فقط)
 const { initFuturesEngine } = require('./services/futuresEngine');
 const { initFuturesPriceFeed } = require('./services/futuresPriceFeed');
@@ -242,7 +241,7 @@ const start = async () => {
     safeInit('AI Price WebSocket', () => initializePriceWebSocket(io));
     safeInit('AI Schedule', () => schedulePredictionFetch(io));
     safeInit('Blockchain Watchers', () => startAllWatchers());
-    safeInit('Spot Price Hub', () => initSpotPriceHub(io)); // ديناميكي للأوامر المعلقة
+   safeInit('Spot Price Poller (HTTP-Only)', () => initializeSpotPolling(io));
 
     // أخر تشغيل الفيوتشر قليلاً بعد اتصال Mongo واستقرار السيرفر
     setTimeout(() => {
