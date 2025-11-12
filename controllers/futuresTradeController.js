@@ -1,5 +1,5 @@
 // controllers/futuresTradeController.js
-const mongoose = require('mongoose');
+
 const { FutureTrade, validateFutureTrade } = require('../models/FutureTrade');
 const { FuturesWallet } = require('../models/FutureWallet');
 const { FuturesWalletBalance } = require('../models/FutureWalletBalance');
@@ -7,9 +7,17 @@ const { FuturesTradeHistory } = require('../models/FutureTradeHistory');
 const { TradingPair } = require('../models/TradingPair');
 const { Asset } = require('../models/Asset');
 const { Notification } = require('../models/Notification');
-const { getCurrentPrice, ensureCurrentPrice, addFuturesSymbol, removeFuturesSymbol } = require('../services/futuresPriceFeed');
+
+const {
+  getCurrentPrice,
+  ensureCurrentPrice,
+  watchSymbolForTrade,
+  unwatchSymbolForTrade,
+} = require('../services/futuresPriceFeed');
+
 const { closeTrade } = require('../services/futuresEngine');
 
+// Helpers
 function getUserId(req) {
   return (
     req.user?._id ||
@@ -29,27 +37,7 @@ async function ensureUSDTBalance(futures_wallet_id) {
   return bal;
 }
 
-function calcLiquidationSafe({
-  side, qty, entryPrice, baseEquity, leverage, mmr = 0.004, feesBuffer = 0,
-}) {
-  const q = Math.max(0, Number(qty));
-  const E = Math.max(0, Number(entryPrice));
-  const equityAdj = Math.max(0, Number(baseEquity)) - Math.max(0, Number(feesBuffer));
-  if (!isFinite(q) || q <= 0 || !isFinite(E) || E <= 0 || !isFinite(leverage) || leverage <= 0) {
-    return Math.max(0.01, E * (side === 'Long' ? (1 - 1 / Math.max(leverage, 1)) : (1 + 1 / Math.max(leverage, 1))));
-  }
-  let P;
-  if (side === 'Long') {
-    P = (E - equityAdj / q) / Math.max(1e-9, 1 - mmr);
-    if (!isFinite(P) || P <= 0 || P >= E) P = E * (1 - 1 / leverage);
-  } else {
-    P = (E + equityAdj / q) / (1 + mmr);
-    if (!isFinite(P) || P <= 0 || P <= E) P = E * (1 + 1 / leverage);
-  }
-  return Math.max(0.01, P);
-}
-
-// === POST /api/futures/trade
+// POST /api/futures/trade
 async function createFutureTrade(req, res) {
   const { error, value } = validateFutureTrade(req.body);
   if (error) return res.status(400).json({ message: error.details[0].message });
@@ -102,10 +90,7 @@ async function createFutureTrade(req, res) {
       bal.balance -= IM;
       await bal.save();
 
-      const baseEquity = margin_type === 'Cross' ? IM + bal.balance : IM;
-      const liq = calcLiquidationSafe({
-        side: position, qty: q, entryPrice: E, baseEquity, leverage, mmr: 0.004, feesBuffer: notional * 0.0005,
-      });
+      const liq = E * (position === 'Long' ? (1 - 1 / leverage) : (1 + 1 / leverage));
 
       trade.status = 'Filled';
       trade.open_price = E;
@@ -143,8 +128,8 @@ async function createFutureTrade(req, res) {
         });
       } catch {}
 
-      // أصبح الرمز نشطًا (صفقة مفتوحة) -> أضفه للـ poller
-      addFuturesSymbol(symbol);
+      // ابدأ مراقبة هذا الزوج
+      watchSymbolForTrade(symbol);
 
       req.io?.to(String(user_id)).emit('futures_order_status_update', {
         trade_id: trade._id.toString(),
@@ -157,7 +142,7 @@ async function createFutureTrade(req, res) {
       return res.json({ trade });
     }
 
-    // Limit — يبقى Pending
+    // Limit — يبقى Pending (دون WS)
     await trade.save();
 
     try {
@@ -170,16 +155,13 @@ async function createFutureTrade(req, res) {
       });
     } catch {}
 
-    // وجود أمر Pending على هذا الرمز -> أضِف الرمز لمجموعة الرموز النشطة
-    if (pair?.symbol) addFuturesSymbol(pair.symbol);
-
     return res.json({ trade });
   } catch (e) {
     return res.status(400).json({ message: e.message });
   }
 }
 
-// === POST /api/futures/close/:trade_id
+// POST /api/futures/close/:trade_id
 async function closeFutureTrade(req, res) {
   const trade = await FutureTrade.findById(req.params.trade_id).populate('trading_pair_id');
   if (!trade) return res.status(404).json({ message: 'Trade not found' });
@@ -187,21 +169,28 @@ async function closeFutureTrade(req, res) {
   if (trade.status !== 'Filled') return res.status(400).json({ message: 'Trade not open' });
 
   const symbol = String(trade.trading_pair_id.symbol || '').toUpperCase();
-  const price = getCurrentPrice(symbol);
+  const price = getCurrentPrice(symbol) || (await ensureCurrentPrice(symbol));
   if (!price || price <= 0) return res.status(400).json({ message: 'Price unavailable' });
 
-  await closeTrade(trade, 'Manual Close', price);
+  const result = await closeTrade(trade, 'Manual Close', price);
 
-  // بعد الإغلاق: إذا لم يعد هناك نشاط على هذا الرمز -> أزله
-  const anyOpen  = await FutureTrade.exists({ trading_pair_id: trade.trading_pair_id, status: 'Filled' });
-  const anyLimit = await FutureTrade.exists({ trading_pair_id: trade.trading_pair_id, status: 'Pending', order_type: 'Limit' });
-  if (!anyOpen && !anyLimit) removeFuturesSymbol(symbol);
+  req.io?.to(String(trade.user_id)).emit('futures_order_status_update', {
+    trade_id: trade._id.toString(),
+    status: 'Closed',
+    symbol,
+    close_price: result?.close_price,
+    pnl: result?.pnl,
+  });
 
-  const updated = await FutureTrade.findById(trade._id);
-  return res.json({ trade: updated });
+  return res.json({
+    ok: true,
+    symbol,
+    close_price: result?.close_price,
+    pnl: result?.pnl,
+  });
 }
 
-// === POST /api/futures/cancel/:trade_id
+// POST /api/futures/cancel/:trade_id
 async function cancelFutureTrade(req, res) {
   const trade = await FutureTrade.findById(req.params.trade_id).populate('trading_pair_id');
   if (!trade) return res.status(404).json({ message: 'Trade not found' });
@@ -210,16 +199,26 @@ async function cancelFutureTrade(req, res) {
     return res.status(400).json({ message: 'Only pending limit orders can be canceled' });
   }
 
-  trade.status = 'Closed';
-  trade.closed_at = new Date();
-  await trade.save();
-
   const symbol = String(trade?.trading_pair_id?.symbol || '').toUpperCase();
 
-  // أزل الرمز من النشط إن لم يبقَ Pending/Limit ولا Filled
-  const anyOpen  = await FutureTrade.exists({ trading_pair_id: trade.trading_pair_id, status: 'Filled' });
-  const anyLimit = await FutureTrade.exists({ trading_pair_id: trade.trading_pair_id, status: 'Pending', order_type: 'Limit' });
-  if (!anyOpen && !anyLimit) removeFuturesSymbol(symbol);
+  await FuturesTradeHistory.create({
+    future_trade_id: trade._id,
+    user_id: trade.user_id,
+    trading_pair_id: trade.trading_pair_id,
+    trading_pair_symbol: symbol,
+    position: trade.position,
+    leverage: trade.leverage,
+    margin_type: trade.margin_type,
+    amount: trade.amount,
+    open_price: trade.open_price || null,
+    close_price: null,
+    pnl: 0,
+    status: 'Cancelled',
+    executed_at: new Date(),
+    created_at: new Date(),
+  });
+
+  await FutureTrade.deleteOne({ _id: trade._id });
 
   req.io?.to(String(trade.user_id)).emit('futures_order_status_update', {
     trade_id: trade._id.toString(),
@@ -229,7 +228,7 @@ async function cancelFutureTrade(req, res) {
   return res.json({ ok: true });
 }
 
-// === GET /api/futures/history/:user_id
+// GET /api/futures/history/:user_id
 async function getFutureTradeHistory(req, res) {
   const items = await FuturesTradeHistory.find({ user_id: req.params.user_id })
     .sort({ executed_at: -1 })
@@ -237,7 +236,7 @@ async function getFutureTradeHistory(req, res) {
   return res.json({ history: items });
 }
 
-// === GET /api/futures/open/:user_id
+// GET /api/futures/open/:user_id
 async function getOpenFutureTrades(req, res) {
   const open = await FutureTrade.find({ user_id: req.params.user_id, status: 'Filled' })
     .populate({ path: 'trading_pair_id', select: 'symbol' })

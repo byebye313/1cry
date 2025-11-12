@@ -1,10 +1,10 @@
 // services/binanceServices.js
-// HTTP-only Spot Price Poller (no WebSockets).
-// - Polls Binance REST every SPOT_POLL_MS (default 40000 ms) for *active* symbols
-//   (symbols that have pending Spot/Limit orders).
-// - Executes Spot/Limit orders when price touches condition.
-// - Provides getCachedPrice / ensureSpotPrice for controllers.
+// Production-grade dynamic price hub for SPOT LIMIT orders only.
+// - Opens one WS per *active* symbol that has pending Spot limit orders.
+// - Executes Spot limit orders on-touch.
+// - Provides in-memory cache + REST fallback for on-demand price (e.g., Market).
 
+const WebSocket = require('ws');
 const axios = require('axios');
 const mongoose = require('mongoose');
 
@@ -17,60 +17,123 @@ const { Notification } = require('../models/Notification');
 const { Referral } = require('../models/Refferal');
 
 // ===================== Config =====================
-const SPOT_POLL_MS = Number(process.env.SPOT_POLL_MS || 40000); // 40s
-const PRICE_TTL_MS = Number(process.env.PRICE_CACHE_TTL_MS || 15000); // consider price fresh for 15s
-const HTTP_TIMEOUT_MS = Number(process.env.PRICE_HTTP_TIMEOUT_MS || 3500);
-
-// REST mirrors (fallback)
-const SPOT_BASES = (process.env.SPOT_BASES ||
-  'https://api.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com'
-).split(',').map(s => s.trim()).filter(Boolean);
+const BINANCE_WS_BASE = 'wss://stream.binance.com:9443/ws';
+const BINANCE_REST_BASE = 'https://api.binance.com';
+const PRICE_TTL_MS = 7000;      // cache TTL
+const HEARTBEAT_MS = 25000;
 
 // ===================== State ======================
-let io; // socket.io instance (اختياري للإشعارات)
-const priceMap = new Map();        // symbol => { price, ts }
-const activeSpotSymbols = new Set(); // symbols having pending Spot/Limit orders
-let spotTimer = null;
-let reconTimer = null;
+let io;                                    // socket.io instance
+const priceMap = new Map();                // symbol => { price, ts }
+const sockets = new Map();                 // symbol => ws
+const spotRefs = new Map();                // symbol => Set(orderId)  (ref-count by spot order)
+const reconciling = { running: false };    // avoid overlapping reconciles
 
-// helper
-function _U(s) { return String(s || '').trim().toUpperCase(); }
+function _sym(s) { return String(s || '').trim().toUpperCase(); }
 
 // ===================== Price utils =================
 function getCurrentPrice(symbol) {
-  const rec = priceMap.get(_U(symbol));
+  const rec = priceMap.get(_sym(symbol));
   if (!rec || Date.now() - rec.ts > PRICE_TTL_MS) return 0;
   return rec.price;
 }
 
-async function _fetchWithFallback(path, params) {
-  let lastErr;
-  for (const base of SPOT_BASES) {
-    try {
-      const { data } = await axios.get(`${base}${path}`, { params, timeout: HTTP_TIMEOUT_MS });
-      return data;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error('All spot bases failed');
-}
-
 async function ensureCurrentPrice(symbol) {
-  const s = _U(symbol);
+  const s = _sym(symbol);
   const cached = getCurrentPrice(s);
   if (cached > 0) return cached;
 
-  const data = await _fetchWithFallback('/api/v3/ticker/price', { symbol: s });
+  const { data } = await axios.get(`${BINANCE_REST_BASE}/api/v3/ticker/price`, {
+    params: { symbol: s },
+    timeout: 3500,
+  });
   const p = Number(data?.price);
   if (!isFinite(p) || p <= 0) throw new Error(`Invalid price from REST for ${s}`);
   priceMap.set(s, { price: p, ts: Date.now() });
   return p;
 }
 
+// ===================== WS management ===============
+function _bindWS(symbol) {
+  const s = _sym(symbol);
+  if (sockets.has(s)) return;
+
+  const ws = new WebSocket(`${BINANCE_WS_BASE}/${s.toLowerCase()}@trade`);
+  let hb;
+
+  ws.on('open', () => {
+    hb = setInterval(() => { try { ws.ping(); } catch {} }, HEARTBEAT_MS);
+  });
+
+  ws.on('message', async (buf) => {
+    try {
+      const msg = JSON.parse(buf.toString());
+      const p = Number(msg.p);
+      if (!isFinite(p) || p <= 0) return;
+      priceMap.set(s, { price: p, ts: Date.now() });
+
+      // Emit price to clients (optional)
+      io?.emit('price_update', { symbol: s, price: p, timestamp: new Date().toISOString() });
+
+      // Try execute Spot limit orders for this symbol only
+      await _executeSpotLimitOrdersForSymbol(s, p);
+    } catch (err) {
+      console.error('WS message error:', err.message);
+    }
+  });
+
+  ws.on('error', (e) => {
+    console.error(`WS error for ${s}:`, e.message);
+    // soft fallback: try REST once (non-blocking)
+    ensureCurrentPrice(s).catch(() => {});
+  });
+
+  ws.on('close', () => {
+    try { clearInterval(hb); } catch {}
+    sockets.delete(s);
+    // If still referenced, reconnect
+    if ((spotRefs.get(s)?.size || 0) > 0) {
+      setTimeout(() => _bindWS(s), 1000);
+    }
+  });
+
+  sockets.set(s, ws);
+}
+
+function _maybeCloseWS(symbol) {
+  const s = _sym(symbol);
+  const refs = spotRefs.get(s);
+  if (!refs || refs.size === 0) {
+    const ws = sockets.get(s);
+    if (ws) {
+      try { ws.close(); } catch {}
+      sockets.delete(s);
+    }
+  }
+}
+
+// Public: acquire/release for a SPOT limit order
+function watchSymbolForSpotOrder(symbol, orderId) {
+  const s = _sym(symbol);
+  let set = spotRefs.get(s);
+  if (!set) { set = new Set(); spotRefs.set(s, set); }
+  if (!set.has(String(orderId))) {
+    set.add(String(orderId));
+    if (set.size === 1) _bindWS(s);  // first reference: open WS
+  }
+}
+
+function unwatchSymbolForSpotOrder(symbol, orderId) {
+  const s = _sym(symbol);
+  const set = spotRefs.get(s);
+  if (!set) return;
+  set.delete(String(orderId));
+  if (set.size === 0) _maybeCloseWS(s);
+}
+
 // ===================== Spot execution ==============
 async function _executeSpotTrade(trade, tradingPair, order, currentPrice) {
-  // نفس منطقك السابق لكن بدون WS
+  // mirrors your previous logic but scoped for SPOT only
   const spotWallet = await SpotWallet.findById(trade.spot_wallet_id);
   if (!spotWallet) throw new Error('Spot wallet not found');
 
@@ -88,6 +151,7 @@ async function _executeSpotTrade(trade, tradingPair, order, currentPrice) {
 
   const totalCost = currentPrice * order.amount;
 
+  // update balances
   if (trade.trade_type === 'Buy') {
     quoteAssetBalance.balance -= totalCost;
     baseAssetBalance.balance = (baseAssetBalance.balance || 0) + trade.amount;
@@ -108,7 +172,7 @@ async function _executeSpotTrade(trade, tradingPair, order, currentPrice) {
     order.save(),
   ]);
 
-  // Referral check (كما هو)
+  // Referral check (unchanged)
   try {
     const referral = await Referral.findOne({ referred_user_id: trade.user_id, status: 'Pending' });
     if (referral && totalCost >= 50) {
@@ -127,6 +191,7 @@ async function _executeSpotTrade(trade, tradingPair, order, currentPrice) {
     }
   } catch {}
 
+  // Notify
   await new Notification({
     user_id: trade.user_id,
     type: 'SpotTrade',
@@ -143,9 +208,13 @@ async function _executeSpotTrade(trade, tradingPair, order, currentPrice) {
     total_cost: trade.total_cost,
     timestamp: new Date().toISOString(),
   });
+
+  // release WS reference for this specific order
+  unwatchSymbolForSpotOrder(tradingPair.symbol, order._id);
 }
 
 async function _executeSpotLimitOrdersForSymbol(symbol, currentPrice) {
+  // Only pending orders for this symbol
   const pair = await TradingPair.findOne({ symbol });
   if (!pair) return;
 
@@ -155,15 +224,13 @@ async function _executeSpotLimitOrdersForSymbol(symbol, currentPrice) {
     status: 'Pending',
   }).limit(500);
 
-  if (!pending.length) {
-    // لا أوامر لهذا الرمز — أزله من النشط
-    activeSpotSymbols.delete(symbol);
-    return;
-  }
-
   for (const order of pending) {
     const trade = await SpotTrade.findById(order.trade_id);
-    if (!trade) continue;
+    if (!trade) {
+      // orphan order: cleanup reference (defensive)
+      unwatchSymbolForSpotOrder(symbol, order._id);
+      continue;
+    }
 
     const canExecute =
       (order.trade_type === 'Buy'  && currentPrice <= order.price) ||
@@ -175,73 +242,44 @@ async function _executeSpotLimitOrdersForSymbol(symbol, currentPrice) {
   }
 }
 
-// ===================== Polling logic =================
-async function _pollOneSpotSymbol(symbol) {
-  // جلب السعر + تنفيذ أوامر الرمز
-  try {
-    const price = await ensureCurrentPrice(symbol);
-    if (!price || price <= 0) return;
-    await _executeSpotLimitOrdersForSymbol(symbol, price);
-  } catch (e) {
-    // فشل REST — نتخطّى هذه الدورة فقط
-    // يمكن إضافة backoff/jitter من ENV لاحقًا لو رغبت
-  }
-}
-
-function _startSpotPollingLoop() {
-  if (spotTimer) return;
-  spotTimer = setInterval(async () => {
-    const list = Array.from(activeSpotSymbols);
-    for (const sym of list) {
-      const jitter = Math.floor(Math.random() * 500); // تفادي burst
-      await new Promise(r => setTimeout(r, jitter));
-      await _pollOneSpotSymbol(sym);
-    }
-  }, SPOT_POLL_MS);
-}
-
+// ===================== Bootstrapping =================
 async function _reconcileActiveSpotSymbols() {
-  // بناء قائمة الرموز النشطة من قاعدة البيانات (كل دقيقة)
+  if (reconciling.running) return;
+  reconciling.running = true;
   try {
+    // find symbols that actually have PENDING Spot orders
     const pendingOrders = await OrderBook.find({ order_type: 'Spot', status: 'Pending' })
-      .select(['trading_pair_id']).limit(5000);
+      .select(['trading_pair_id', '_id', 'price']).limit(2000);
+    if (!pendingOrders.length) return;
+
     const pairIds = [...new Set(pendingOrders.map(o => String(o.trading_pair_id)))];
-    if (!pairIds.length) {
-      activeSpotSymbols.clear();
-      return;
-    }
     const pairs = await TradingPair.find({ _id: { $in: pairIds } }).select(['symbol']);
-    const symbols = pairs.map(p => _U(p.symbol));
-    // حدّث المجموعة
-    activeSpotSymbols.clear();
-    for (const s of symbols) activeSpotSymbols.add(s);
-  } catch (e) {
-    // تجاهل مؤقتًا
+    const idToSym = new Map(pairs.map(p => [String(p._id), p.symbol]));
+
+    // ensure a WS for each symbol with at least one pending order
+    for (const order of pendingOrders) {
+      const sym = idToSym.get(String(order.trading_pair_id));
+      if (!sym) continue;
+      watchSymbolForSpotOrder(sym, order._id); // this opens WS if first reference
+    }
+  } finally {
+    reconciling.running = false;
   }
 }
 
-function addSpotSymbol(symbol)    { activeSpotSymbols.add(_U(symbol)); }
-function removeSpotSymbol(symbol) { activeSpotSymbols.delete(_U(symbol)); }
-
-function initializeSpotPolling(ioInstance) {
+function initializeWebSockets(ioInstance) {
   io = ioInstance;
-  // تشغيل البولّينغ
-  _startSpotPollingLoop();
-  // Reconcile دوري لالتقاط أوامر منشأة من عقد أخرى
-  if (reconTimer) clearInterval(reconTimer);
-  _reconcileActiveSpotSymbols().catch(() => {});
-  reconTimer = setInterval(() => _reconcileActiveSpotSymbols().catch(() => {}), 60_000);
+  // No global WS for all pairs. Start empty, then reconcile from DB.
+  _reconcileActiveSpotSymbols().catch((e) => console.error('reconcile error:', e.message));
+  // optional: periodic reconcile (e.g., every 60s) to catch orders created on other nodes
+  setInterval(() => _reconcileActiveSpotSymbols().catch(() => {}), 60_000);
 }
 
 module.exports = {
-  // init
-  initializeSpotPolling,
-
-  // price helpers
+  // public API
+  initializeWebSockets,
   getCurrentPrice,
   ensureCurrentPrice,
-
-  // active sets (يستدعيها الكنترولر عند إنشاء/إلغاء أوامر)
-  addSpotSymbol,
-  removeSpotSymbol,
+  watchSymbolForSpotOrder,
+  unwatchSymbolForSpotOrder,
 };

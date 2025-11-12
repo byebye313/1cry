@@ -45,7 +45,7 @@ async function fetchBinanceFuturesUSDTAssets() {
 
 async function seedAssetsAndBalances() {
   try {
-    await mongoose.connect('mongodb+srv://hass:Youzghadli%40123@cluster0.fhefpqk.mongodb.net/1cryptox', {
+    await mongoose.connect('mongodb://localhost/trading_platform', {
       useNewUrlParser: true,
       useUnifiedTopology: true,
     });

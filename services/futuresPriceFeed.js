@@ -1,137 +1,120 @@
 // services/futuresPriceFeed.js
-// HTTP-only Futures Price Poller (no WebSockets).
-// - Polls Binance REST every FUTURES_POLL_MS (default 40000 ms) for *active* symbols:
-//   (symbols that have Pending/Limit futures orders or Filled/open futures trades).
-// - Provides getCurrentPrice / ensureCurrentPrice for controllers & engine.
+// Dynamic price feed: watch only symbols used by OPEN FutureTrades
 
+const WebSocket = require('ws');
 const axios = require('axios');
-const { FutureTrade } = require('../models/FutureTrade');
-const { TradingPair } = require('../models/TradingPair');
 
-// ============ Config ============
-const FUTURES_POLL_MS     = Number(process.env.FUTURES_POLL_MS || 40000);  // 40s
-const PRICE_TTL_MS        = Number(process.env.FUTURES_PRICE_TTL_MS || 15000); // consider price fresh for 15s
-const HTTP_TIMEOUT_MS     = Number(process.env.FUTURES_HTTP_TIMEOUT_MS || 3500);
-const RECONCILE_EVERY_MS  = Number(process.env.FUTURES_RECONCILE_MS || 60000); // 60s: rebuild active set
+const BINANCE_WS_BASE = 'wss://stream.binance.com:9443/ws';
+const BINANCE_REST_BASE = 'https://api.binance.com';
+const PRICE_TTL_MS = 7_000; // cache TTL
+const HEARTBEAT_MS = 25_000;
 
-// Binance REST mirrors (fallback rotation)
-const FUTURES_BASES = (process.env.FUTURES_BASES ||
-  'https://fapi.binance.com,https://fapi1.binance.com,https://fapi2.binance.com,https://fapi3.binance.com'
-).split(',').map(s => s.trim()).filter(Boolean);
+const priceMap = new Map();      // symbol => { price, ts }
+const sockets = new Map();       // symbol => ws
+const refCounts = new Map();     // symbol => number of open trades using it
 
-// ============ State ============
-const priceCache     = new Map();     // symbol => { price:number, ts:number }
-const activeSymbols  = new Set();     // FUTURES symbols to poll
-let pollTimer        = null;
-let reconcileTimer   = null;
-
-function _U(s) { return String(s || '').trim().toUpperCase(); }
-
-// ============ HTTP helpers ============
-async function _fetchWithFallback(path, params) {
-  let lastErr;
-  for (const base of FUTURES_BASES) {
-    try {
-      const { data } = await axios.get(`${base}${path}`, { params, timeout: HTTP_TIMEOUT_MS });
-      return data;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error('All futures bases failed');
+function _norm(symbol) {
+  return String(symbol || '').trim().toUpperCase();
 }
 
-async function _fetchPriceHTTP(symbol) {
-  const s = _U(symbol);
-  const data = await _fetchWithFallback('/fapi/v1/ticker/price', { symbol: s });
-  const p = Number(data?.price);
-  if (!isFinite(p) || p <= 0) throw new Error(`Invalid futures price for ${s}`);
-  priceCache.set(s, { price: p, ts: Date.now() });
-  return p;
-}
-
-// ============ Public price API ============
 function getCurrentPrice(symbol) {
-  const rec = priceCache.get(_U(symbol));
-  if (!rec) return 0;
-  if (Date.now() - rec.ts > PRICE_TTL_MS) return 0;
+  const s = _norm(symbol);
+  const rec = priceMap.get(s);
+  if (!rec) return null;
+  if (Date.now() - rec.ts > PRICE_TTL_MS) return null;
   return rec.price;
 }
 
-// Try cache; if missing/stale, fetch now via REST (ملاحظة: هذا قد يضرب HTTP خارج دورة 40ث إن لم يتوفر سعر حديث)
 async function ensureCurrentPrice(symbol) {
-  const s = _U(symbol);
-  const cached = getCurrentPrice(s);
-  if (cached > 0) return cached;
-  const fresh = await _fetchPriceHTTP(s);
-  return fresh;
-}
+  const s = _norm(symbol);
+  const c = getCurrentPrice(s);
+  if (c && c > 0) return c;
 
-// ============ Active symbols management ============
-function addFuturesSymbol(symbol)    { activeSymbols.add(_U(symbol)); }
-function removeFuturesSymbol(symbol) { activeSymbols.delete(_U(symbol)); }
-
-// بناء مجموعة الرموز النشطة من قاعدة البيانات (Pending/Limit + Filled)
-async function _reconcileActiveSymbols() {
-  try {
-    const pending = await FutureTrade.find({ status: 'Pending', order_type: 'Limit' })
-      .select(['trading_pair_id']).limit(5000);
-    const open    = await FutureTrade.find({ status: 'Filled' })
-      .select(['trading_pair_id']).limit(5000);
-
-    const allIds  = [...new Set([...pending, ...open].map(d => String(d.trading_pair_id)))];
-    if (!allIds.length) { activeSymbols.clear(); return; }
-
-    const pairs = await TradingPair.find({ _id: { $in: allIds } }).select(['symbol']);
-    const symbols = pairs.map(p => _U(p.symbol));
-
-    activeSymbols.clear();
-    for (const s of symbols) activeSymbols.add(s);
-  } catch (e) {
-    // ignore for this cycle
+  const { data } = await axios.get(`${BINANCE_REST_BASE}/api/v3/ticker/price`, {
+    params: { symbol: s },
+    timeout: 3500,
+  });
+  const p = Number(data.price);
+  if (isFinite(p) && p > 0) {
+    priceMap.set(s, { price: p, ts: Date.now() });
+    return p;
   }
+  return null;
 }
 
-// ============ Polling loop ============
-async function _pollOneSymbol(symbol) {
-  try {
-    await _fetchPriceHTTP(symbol);
-  } catch {
-    // fails: skip this cycle
-  }
-}
+function _bindWS(symbol) {
+  const s = _norm(symbol);
+  if (sockets.has(s)) return; // already connected
+  const ws = new WebSocket(`${BINANCE_WS_BASE}/${s.toLowerCase()}@trade`);
 
-function _startPollingLoop() {
-  if (pollTimer) return;
-  pollTimer = setInterval(async () => {
-    const list = Array.from(activeSymbols);
-    for (const sym of list) {
-      const jitter = Math.floor(Math.random() * 500);
-      await new Promise(r => setTimeout(r, jitter));
-      await _pollOneSymbol(sym);
+  let heartbeat;
+  ws.on('open', () => {
+    heartbeat = setInterval(() => {
+      try { ws.ping(); } catch {}
+    }, HEARTBEAT_MS);
+  });
+
+  ws.on('message', (buf) => {
+    try {
+      const msg = JSON.parse(buf.toString());
+      const p = Number(msg.p);
+      if (isFinite(p) && p > 0) {
+        priceMap.set(s, { price: p, ts: Date.now() });
+      }
+    } catch {}
+  });
+
+  ws.on('error', () => { /* noop, auto-retry on close */ });
+
+  ws.on('close', () => {
+    try { clearInterval(heartbeat); } catch {}
+    sockets.delete(s);
+    if ((refCounts.get(s) || 0) > 0) {
+      setTimeout(() => _bindWS(s), 1000);
     }
-  }, FUTURES_POLL_MS);
+  });
+
+  sockets.set(s, ws);
+}
+
+function _maybeCloseWS(symbol) {
+  const s = _norm(symbol);
+  const r = refCounts.get(s) || 0;
+  if (r <= 0) {
+    const ws = sockets.get(s);
+    if (ws) {
+      try { ws.close(); } catch {}
+      sockets.delete(s);
+    }
+  }
+}
+
+/** احجز مراقبة السعر لزوج معيّن (صفقات مفتوحة عليه) */
+function watchSymbolForTrade(symbol) {
+  const s = _norm(symbol);
+  const prev = refCounts.get(s) || 0;
+  refCounts.set(s, prev + 1);
+  if (prev === 0) _bindWS(s);
+}
+
+/** ألغِ حجز المراقبة عند إغلاق/حذف الصفقة */
+function unwatchSymbolForTrade(symbol) {
+  const s = _norm(symbol);
+  const prev = refCounts.get(s) || 0;
+  const next = Math.max(0, prev - 1);
+  refCounts.set(s, next);
+  if (next === 0) _maybeCloseWS(s);
 }
 
 function initFuturesPriceFeed() {
-  // Start polling
-  _startPollingLoop();
-  // Initial reconcile + periodic reconcile
-  _reconcileActiveSymbols().catch(() => {});
-  if (reconcileTimer) clearInterval(reconcileTimer);
-  reconcileTimer = setInterval(() => _reconcileActiveSymbols().catch(() => {}), RECONCILE_EVERY_MS);
+  // نبدأ فارغين؛ الإدارة تتم عبر watch/unwatch
   return true;
 }
 
 module.exports = {
-  // init
   initFuturesPriceFeed,
-
-  // price
   getCurrentPrice,
   ensureCurrentPrice,
-
-  // active mgmt
-  addFuturesSymbol,
-  removeFuturesSymbol,
+  watchSymbolForTrade,
+  unwatchSymbolForTrade,
 };

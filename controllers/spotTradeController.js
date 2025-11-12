@@ -11,9 +11,11 @@ const { Referral } = require('../models/Refferal');
 const {
   getCurrentPrice,
   ensureCurrentPrice,
-  addSpotSymbol,
-  removeSpotSymbol,
+  watchSymbolForSpotOrder,
+  unwatchSymbolForSpotOrder,
 } = require('../services/binanceServices');
+
+const axios = require('axios');
 
 async function createSpotTrade(req, res) {
   const { error } = validateSpotTrade(req.body);
@@ -125,7 +127,7 @@ async function createSpotTrade(req, res) {
 
       return res.status(201).send(trade);
     } else {
-      // Limit: create OrderBook + أضف الرمز للنشط ليبدأ Poller
+      // Limit: create OrderBook + start watching its symbol
       const orderData = {
         trading_pair_id,
         trade_id: trade._id.toString(),
@@ -143,8 +145,8 @@ async function createSpotTrade(req, res) {
       await order.save();
       await trade.save();
 
-      // أبلغ الـPoller أن هذا الرمز لديه أوامر معلّقة
-      addSpotSymbol(tradingPair.symbol);
+      // start dynamic WS for this symbol keyed by this order id
+      watchSymbolForSpotOrder(tradingPair.symbol, order._id);
 
       await new Notification({
         user_id: userIdAsObjectId,
@@ -177,15 +179,10 @@ async function cancelSpotTrade(req, res) {
     await trade.save();
     if (order) await order.save();
 
-    // بعد الإلغاء: إن لم يعد هناك أوامر معلّقة لهذا الرمز — أزله من مجموعة النشط
-    const pair = await TradingPair.findById(trade.trading_pair_id).select('symbol');
-    if (pair?.symbol) {
-      const anyPending = await OrderBookModel.exists({
-        trading_pair_id: trade.trading_pair_id,
-        order_type: 'Spot',
-        status: 'Pending',
-      });
-      if (!anyPending) removeSpotSymbol(pair.symbol);
+    // release dynamic watch if any
+    if (order) {
+      const pair = await TradingPair.findById(trade.trading_pair_id).select('symbol');
+      if (pair?.symbol) unwatchSymbolForSpotOrder(pair.symbol, order._id);
     }
 
     const tradingPair = await TradingPair.findById(trade.trading_pair_id);
