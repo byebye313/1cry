@@ -27,7 +27,7 @@ const sampleWallets = [
 
 const seedAssets = async () => {
   try {
-    await mongoose.connect('mongodb://localhost/trading_platform', {
+    await mongoose.connect('mongodb+srv://hass:Youzghadli%40123@cluster0.fhefpqk.mongodb.net/1cryptox', {
       useNewUrlParser: true,
       useUnifiedTopology: true,
     });

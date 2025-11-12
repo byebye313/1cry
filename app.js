@@ -85,8 +85,8 @@ app.use(helmet({
 app.use(compression());
 
 // حدود أحجام الطلبات
-app.use(express.json({ limit: '512kb' }));
-app.use(express.urlencoded({ extended: true, limit: '512kb' }));
+app.use(express.json({ limit: '999kb' }));
+app.use(express.urlencoded({ extended: true, limit: '999kb' }));
 
 // لوجر خاص بك
 app.use(logger);
