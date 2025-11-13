@@ -55,8 +55,12 @@ async function createFutureTrade(req, res) {
     const pair = await TradingPair.findById(trading_pair_id);
     if (!pair) return res.status(404).json({ message: 'Trading pair not found' });
 
-    let wallet = await FuturesWallet.findOne({ user_id });
-    if (!wallet) wallet = await FuturesWallet.create({ user_id });
+let wallet = await FuturesWallet.findOne({ user_id });
+if (!wallet) {
+  return res.status(400).json({
+    message: 'Futures wallet not found. Please initialize your futures wallet first.'
+  });
+}
 
     const bal = await ensureUSDTBalance(wallet._id);
 

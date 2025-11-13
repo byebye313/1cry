@@ -131,6 +131,7 @@ function unwatchSymbolForSpotOrder(symbol, orderId) {
   if (set.size === 0) _maybeCloseWS(s);
 }
 
+
 // ===================== Spot execution ==============
 async function _executeSpotTrade(trade, tradingPair, order, currentPrice) {
   // mirrors your previous logic but scoped for SPOT only
@@ -149,43 +150,58 @@ async function _executeSpotTrade(trade, tradingPair, order, currentPrice) {
     throw new Error('Asset balance not found');
   }
 
-  const totalCost = currentPrice * order.amount;
+  // 👇 تكلفة التنفيذ الفعلية بناءً على السعر الحالي
+  const actualCost = currentPrice * order.amount;
 
-  // update balances
+  let totalCostForRecord = actualCost;
+
   if (trade.trade_type === 'Buy') {
-    quoteAssetBalance.balance -= totalCost;
+    // 👇 BUY LIMIT:
+    // تم حجز المبلغ سابقاً = limit_price * amount
+    const reservedCost = (trade.limit_price || currentPrice) * order.amount;
+    let refund = reservedCost - actualCost;
+    if (refund < 0) refund = 0; // احتياطياً، المفترض ألا يحدث لأن currentPrice <= limit_price
+
+    if (refund > 0) {
+      quoteAssetBalance.balance = (quoteAssetBalance.balance || 0) + refund;
+    }
+
+    // إضافة كمية الأصل الأساسي للمستخدم
     baseAssetBalance.balance = (baseAssetBalance.balance || 0) + trade.amount;
+
+    totalCostForRecord = actualCost;
   } else {
-    baseAssetBalance.balance -= trade.amount;
-    quoteAssetBalance.balance = (quoteAssetBalance.balance || 0) + totalCost;
+    // 👇 SELL LIMIT:
+    // تم حجز كمية الأصل الأساسي بالفعل عند إنشاء الأوردر
+    // هنا فقط نضيف عائد البيع إلى USDT
+    quoteAssetBalance.balance = (quoteAssetBalance.balance || 0) + actualCost;
+    totalCostForRecord = actualCost;
   }
 
   trade.executed_price = currentPrice;
-  trade.total_cost = totalCost;
+  trade.total_cost = totalCostForRecord;
   trade.status = 'Filled';
   order.status = 'Filled';
 
-  await Promise.all([
-    quoteAssetBalance.save(),
-    baseAssetBalance.save(),
-    trade.save(),
-    order.save(),
-  ]);
+  await Promise.all([quoteAssetBalance.save(), baseAssetBalance.save(), trade.save(), order.save()]);
 
   // Referral check (unchanged)
   try {
-    const referral = await Referral.findOne({ referred_user_id: trade.user_id, status: 'Pending' });
-    if (referral && totalCost >= 50) {
+    const referral = await Referral.findOne({
+      referred_user_id: trade.user_id,
+      status: 'Pending',
+    });
+    if (referral && totalCostForRecord >= 50) {
       referral.status = 'Eligible';
       referral.trade_met = true;
-      referral.trade_amount = totalCost;
+      referral.trade_amount = totalCostForRecord;
       await referral.save();
 
       await new Notification({
         user_id: referral.referrer_id,
         type: 'Referral',
         title: 'Referral Status Updated',
-        message: `Your referral's trade of ${totalCost} USDT has met the 50 USDT minimum. Status updated to Eligible!`,
+        message: `Your referral's trade of ${totalCostForRecord} USDT has met the 50 USDT minimum. Status updated to Eligible!`,
         is_read: false,
       }).save();
     }
@@ -212,6 +228,7 @@ async function _executeSpotTrade(trade, tradingPair, order, currentPrice) {
   // release WS reference for this specific order
   unwatchSymbolForSpotOrder(tradingPair.symbol, order._id);
 }
+
 
 async function _executeSpotLimitOrdersForSymbol(symbol, currentPrice) {
   // Only pending orders for this symbol
